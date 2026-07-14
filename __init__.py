@@ -70,6 +70,9 @@ _WRITE_HEADERS = {
 # 超过此秒数的标记差异视为「重启」
 _RESTART_THRESHOLD_SECONDS = 30
 
+# 自动存记忆的 URI 前缀，用于在搜索结果中过滤当前 session 的自存内容
+_AUTO_MEMORIES_URI_PREFIX = "viking://resources/hermes-auto-memories/"
+
 
 # ─── 重启无感感知 ─────────────────────────────────────
 
@@ -152,13 +155,13 @@ def _get_last_session_summary(before_ts: float, current_ts: float) -> str | None
     if not STATE_DB.exists() or before_ts <= 0:
         return None
 
-    try:
-        import sqlite3
+    import sqlite3
 
+    db = None
+    try:
         db = sqlite3.connect(str(STATE_DB), timeout=5.0)
         db.row_factory = sqlite3.Row
 
-        # 获取 current_ts 之前最后一个会话（即重启前活跃的那个）
         session = db.execute(
             """
             SELECT id, source, model, started_at, message_count
@@ -172,10 +175,8 @@ def _get_last_session_summary(before_ts: float, current_ts: float) -> str | None
         ).fetchone()
 
         if not session:
-            db.close()
             return None
 
-        # 取前 2 条 user 消息看看在聊什么
         messages = db.execute(
             """
             SELECT role, content
@@ -186,8 +187,6 @@ def _get_last_session_summary(before_ts: float, current_ts: float) -> str | None
             """,
             (session["id"],),
         ).fetchall()
-
-        db.close()
 
         parts = [f"上一个会话（{session['source']}）"]
         for msg in messages:
@@ -201,6 +200,12 @@ def _get_last_session_summary(before_ts: float, current_ts: float) -> str | None
     except Exception as e:
         logger.warning("Failed to query state.db: %s", e)
         return None
+    finally:
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 # ─── 记忆搜索（pre_llm_call） ───────────────────────────────
@@ -268,12 +273,27 @@ def _search_openviking(query: str, limit: int) -> list[dict]:
     return filtered[:safe_limit]
 
 
-def _build_memory_context(items: list[dict]) -> str | None:
-    """Format search results into a compact context string."""
+def _build_memory_context(items: list[dict], exclude_session_id: str = "") -> str | None:
+    """Format search results into a compact context string.
+
+    过滤掉 auto-save 写入的当前会话内容（自反馈循环防护）。
+    """
     lines = []
     for item in items:
         abstract = (item.get("abstract") or "").strip()
         ctype = item.get("context_type", "memory")
+        uri = item.get("uri", "")
+
+        # 自反馈过滤：跳过 auto-memories 路径下当前 session 自己存的内容
+        if exclude_session_id and _AUTO_MEMORIES_URI_PREFIX in uri:
+            sid_prefix = exclude_session_id[:12]
+            if sid_prefix in abstract or sid_prefix in uri:
+                logger.debug(
+                    "Skipping auto-saved memory from current session %s",
+                    sid_prefix,
+                )
+                continue
+
         if abstract:
             label = ctype.capitalize()
             lines.append(f"• [{label}] {abstract[:ABSTRACT_MAX_LENGTH]}")
@@ -363,8 +383,9 @@ def auto_save_memories(
     if len(assistant_text) > 120:
         assistant_summary += "..."
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_dt = datetime.now()
+    today = now_dt.strftime("%Y-%m-%d")
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M")
 
     content = (
         f"## 对话摘要\n\n"
@@ -414,10 +435,10 @@ def auto_save_memories(
                 req_create = urllib.request.Request(
                     CONTENT_WRITE_ENDPOINT,
                     data=payload_create,
-                    headers=SEARCH_HEADERS,
+                    headers=_WRITE_HEADERS,
                     method="POST",
                 )
-                with urllib.request.urlopen(req_create, timeout=10) as cr:
+                with urllib.request.urlopen(req_create, timeout=REQUEST_TIMEOUT) as cr:
                     create_body = json.loads(cr.read().decode("utf-8"))
                     if create_body.get("status") == "ok":
                         _AUTO_SAVE_LAST_SAVED[session_id] = time.time()
@@ -454,6 +475,12 @@ def inject_relevant_memories(
     """
     context_parts = []
 
+    logger.debug(
+        "inject: RESTART_DETECTED=%s, session_id=%s, notified=%s, first_turn=%s, msg_len=%d",
+        _RESTART_DETECTED, session_id[:16], session_id in _RESTART_NOTIFIED_SESSIONS,
+        is_first_turn, len(user_message),
+    )
+
     # 第 1 层：重启通知（每个 session 只注入一次，不依赖 is_first_turn）
     if _RESTART_DETECTED and session_id not in _RESTART_NOTIFIED_SESSIONS:
         _RESTART_NOTIFIED_SESSIONS.add(session_id)
@@ -469,19 +496,24 @@ def inject_relevant_memories(
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         context_parts.append("\n".join(lines))
 
-    # 第 2 层：OpenViking 记忆搜索
+    # 第 2 层：OpenViking 记忆搜索（过滤当前 session 的 auto-save 内容）
     if _should_search(user_message, is_first_turn):
         limit = MAX_RESULTS_FIRST_TURN if is_first_turn else MAX_RESULTS_SUBSEQUENT
         items = _search_openviking(user_message, limit)
-        memory_ctx = _build_memory_context(items)
+        memory_ctx = _build_memory_context(items, exclude_session_id=session_id)
         if memory_ctx:
             context_parts.append(memory_ctx)
 
     if not context_parts:
+        logger.debug("inject: no context parts, returning None")
         return None
 
     separator = "\n" + "━━━━━━━━━━━━━━━━━━━━━━━━" + "\n"
     merged = separator.join(context_parts)
     full_context = merged + "\n" + "━━━━━━━━━━━━━━━━━━━━━━━━"
 
+    logger.debug(
+        "inject: returning context with %d part(s), len=%d",
+        len(context_parts), len(full_context),
+    )
     return {"context": full_context}
