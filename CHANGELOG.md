@@ -1,18 +1,29 @@
 # Changelog
 
-## v1.1.0 (2026-07-14)
+## [4.2.0] — 2026-07-14
 
 ### 🐛 Bug Fixes
 
-- **P0: 404 fallback 用错 headers** — `auto_save_memories()` 的 append→create 回退路径使用了 `SEARCH_HEADERS`（不含 API Key），导致 create 写入永远失败。改为 `_WRITE_HEADERS`（含 X-API-Key）。同时将 fallback timeout 从硬编码 10s 对齐为 `REQUEST_TIMEOUT`（5s）。
+- **P0: 404 fallback create 请求鉴权失败** — append 模式 404 后 fallback 到 create 时，使用了不带 API Key 的 `SEARCH_HEADERS`，导致请求永远被 OpenViking 拒绝。改为 `_WRITE_HEADERS`。同时修正 fallback 超时从硬编码 10s 统一为 `REQUEST_TIMEOUT`（5s）。
 
-- **SQLite 连接泄漏** — `_get_last_session_summary()` 在异常路径下未关闭 `db` 连接。改用 `try/except/finally` 兜底，与 `auto_save_memories()` 的写法保持一致。
+### 🔄 性能 & 可靠性
 
-### 🔄 功能优化
+- **自反馈循环防护** — 新增 `exclude_session_id` 过滤机制。`_build_memory_context()` 在搜索结果中跳过本会话 auto-save 路径下的内容，防止「当前会话存 → 下轮搜回来 → 重复注入」的恶性循环。
+- **SQLite 连接泄漏修复** — `_get_last_session_summary()` 改用 `try/except/finally`，确保异常路径下 `db.close()` 也能被调用（之前仅 `auto_save_memories()` 正确实现了 finally 关闭）。
+- **`datetime.now()` 单次调用** — 修复两次 `datetime.now()` 调用可能导致跨午夜时日期不一致的问题，改为一次 `now_dt` 后复用。
 
-- **自反馈循环过滤** — auto-save 将当前对话写入 `viking://resources/hermes-auto-memories/` 后，后续轮次的记忆搜索会将其搜回并注入上下文，形成无效的「自己存自己看」循环。修复：`_build_memory_context()` 新增 `exclude_session_id` 参数，三重闸门过滤（非空检查 → URI 前缀匹配 → session_id 文本匹配），确保当前会话的 auto-save 内容不会被注入。
+### 🧹 代码质量
 
-### 🔧 代码质量
+- **日志级别规范化** — 正常流程调试信息（函数入口、返回结果、空结果、过滤跳过）从 `logger.warning` 降级为 `logger.debug`，保留 `warning` 仅用于真实异常/错误路径。减少日志噪声，避免运维告警被淹没。
 
-- **日志级别整理** — 正常流程的 4 处 `logger.warning` 改为 `logger.debug`，避免运维日志被调试信息淹没。保留 8 处 `warning` 用于真实异常路径。
-- **`datetime.now()` 单次调用** — 合并两次调用为一次 `now_dt` 变量复用，避免跨午夜边界的时间不一致。
+## [4.1.0] — 2026-07-12
+
+### ✨ 新功能
+
+- `post_llm_call` 自动存记忆：每轮 LLM 调用后自动将对话概要写入 OpenViking
+
+## [4.0.0] — 2026-07-08
+
+### ✨ 新功能
+
+- 初始版本：pre_llm_call 记忆检索 + 重启无感感知（boot.json PID 标记）
