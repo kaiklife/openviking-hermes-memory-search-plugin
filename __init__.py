@@ -1,12 +1,11 @@
-"""hermes-memory-search: 自动从 OpenViking 拉取相关记忆 + 重启无感感知 + 自动存记忆。
+"""hermes-memory-search: 自动从 OpenViking 拉取相关记忆 + 重启无感感知。
 
 在每轮 LLM 调用前自动搜索 OpenViking 中与当前对话相关的记忆，
-以 context 形式注入系统提示。每轮 LLM 调用后自动保存关键信息到 OpenViking。
+以 context 形式注入系统提示。
 
 重启感知：插件通过 boot.json 标记文件自动检测进程重启。
 检测到重启后，从 state.db 查询上一个会话的内容，自动注入摘要。
-无需手动保存状态，无需额外步骤，完全无感。
-"""
+无需手动保存状态，无需额外步骤，完全无感。"""
 
 from __future__ import annotations
 
@@ -47,11 +46,6 @@ REQUEST_TIMEOUT = 5
 MIN_MSG_LENGTH_FIRST = 2
 MIN_MSG_LENGTH_SUBSEQUENT = 5
 
-# 自动存记忆的最小内容长度 + 冷却时间
-_AUTO_SAVE_MIN_LENGTH = 30
-_AUTO_SAVE_COOLDOWN = 120  # 同一 session 两次保存最短间隔（秒）
-_AUTO_SAVE_LAST_SAVED: dict[str, float] = {}  # session_id -> 上次保存时间
-
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
 STATE_DB = HERMES_HOME / "state.db"
 
@@ -71,7 +65,6 @@ _WRITE_HEADERS = {
 def register(ctx) -> None:
     """Register the hermes-memory-search plugin with the Hermes runtime."""
     ctx.register_hook("pre_llm_call", inject_relevant_memories)
-    ctx.register_hook("post_llm_call", auto_save_memories)
 
 
 def _should_search(user_message: str, is_first_turn: bool) -> bool:
@@ -171,155 +164,6 @@ def _build_memory_context(items: list[dict], exclude_session_id: str = "") -> st
         "📌 **相关记忆（自动从 OpenViking 检索）**\n"
         + "\n".join(lines)
     )
-
-
-# ─── 自动存记忆（post_llm_call） ────────────────────────────
-
-
-def auto_save_memories(
-    session_id: str,
-    model: str = "",
-    platform: str = "",
-    **kwargs,
-) -> None:
-    """LLM 调用后自动保存关键对话内容到 OpenViking。
-
-    读取 state.db 中当前会话的最新一条用户消息和助手回复，
-    如果内容有意义，写入 OpenViking content API。
-    包含冷却窗口、去重、SQLite 连接安全等防护。
-    """
-    if not STATE_DB.exists():
-        return
-
-    # 冷却检查：同一 session 不要太频繁
-    now = time.time()
-    last_saved = _AUTO_SAVE_LAST_SAVED.get(session_id, 0.0)
-    if now - last_saved < _AUTO_SAVE_COOLDOWN:
-        return
-
-    import sqlite3
-
-    db = None
-    try:
-        db = sqlite3.connect(str(STATE_DB), timeout=3.0)
-        db.row_factory = sqlite3.Row
-
-        # 取最后一条 user 消息 + 最后一条 assistant 消息
-        last_user = db.execute(
-            """SELECT content, timestamp FROM messages
-               WHERE session_id = ? AND role = 'user'
-               ORDER BY timestamp DESC LIMIT 1""",
-            (session_id,),
-        ).fetchone()
-
-        last_assistant = db.execute(
-            """SELECT content, timestamp FROM messages
-               WHERE session_id = ? AND role = 'assistant'
-               ORDER BY timestamp DESC LIMIT 1""",
-            (session_id,),
-        ).fetchone()
-
-    except Exception as e:
-        logger.warning("auto_save[%s] state.db query failed: %s", session_id[:12], e)
-        return
-    finally:
-        if db:
-            try:
-                db.close()
-            except Exception:
-                pass
-
-    if not last_user or not last_assistant:
-        return
-
-    user_text = (last_user["content"] or "").strip()
-    assistant_text = (last_assistant["content"] or "").strip()
-
-    # 跳过短消息和确认性回复
-    if len(user_text) < _AUTO_SAVE_MIN_LENGTH:
-        return
-    if user_text in _SKIP_MESSAGES:
-        return
-    if not assistant_text or len(assistant_text) < 10:
-        return
-
-    # 构造概要
-    user_summary = user_text[:80].replace("\n", " ")
-    assistant_summary = assistant_text[:120].replace("\n", " ")
-    if len(assistant_text) > 120:
-        assistant_summary += "..."
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    content = (
-        f"## 对话摘要\n\n"
-        f"- 时间: {now_str}\n"
-        f"- 会话: {session_id[:12]}\n"
-        f"- 模型: {model}\n"
-        f"- 用户: {user_summary}\n"
-        f"- 助手: {assistant_summary}\n\n"
-    )
-
-    # 用日期做文件名，append 模式累积
-    uri = f"viking://resources/hermes-auto-memories/{today}.md"
-    payload = json.dumps({
-        "uri": uri,
-        "content": content,
-        "mode": "append",
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        CONTENT_WRITE_ENDPOINT,
-        data=payload,
-        headers=_WRITE_HEADERS,
-        method="POST",
-    )
-
-    try:
-        try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                if body.get("status") == "ok":
-                    _AUTO_SAVE_LAST_SAVED[session_id] = time.time()
-                    return
-                err_code = body.get("error", {}).get("code", "")
-                logger.warning(
-                    "auto_save[%s] append failed: %s",
-                    session_id[:12], err_code,
-                )
-                return
-        except urllib.error.HTTPError as he:
-            if he.code == 404:
-                # 404 = 文件不存在 -> fallback to create
-                payload_create = json.dumps({
-                    "uri": uri,
-                    "content": content,
-                    "mode": "create",
-                }).encode("utf-8")
-                req_create = urllib.request.Request(
-                    CONTENT_WRITE_ENDPOINT,
-                    data=payload_create,
-                    headers=_WRITE_HEADERS,
-                    method="POST",
-                )
-                with urllib.request.urlopen(req_create, timeout=10) as cr:
-                    create_body = json.loads(cr.read().decode("utf-8"))
-                    if create_body.get("status") == "ok":
-                        _AUTO_SAVE_LAST_SAVED[session_id] = time.time()
-                        return
-                    else:
-                        logger.warning(
-                            "auto_save[%s] create also failed: %s",
-                            session_id[:12],
-                            create_body.get("error", {}).get("code", "?"),
-                        )
-            else:
-                logger.warning(
-                    "auto_save[%s] append HTTP %d", session_id[:12], he.code,
-                )
-    except Exception as e:
-        logger.warning("auto_save[%s] write error: %s", session_id[:12], e)
 
 
 # ─── pre_llm_call 主入口 ───────────────────────────────

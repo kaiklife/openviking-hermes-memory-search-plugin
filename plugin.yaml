@@ -1,7 +1,6 @@
 name: hermes-memory-search
-version: 4.3.0
+version: 4.4.0
 description: Auto-search OpenViking memories + restart awareness via boot.json PID marker
 author: KaiK
 provides_hooks:
   - pre_llm_call
-  - post_llm_call

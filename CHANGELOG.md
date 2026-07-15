@@ -1,5 +1,11 @@
 # Changelog
 
+## [4.4.0] — 2026-07-15
+
+### 🗑️ Removed
+
+- **删除 `auto_save_memories`** — 移除 `post_llm_call` 自动存记忆功能及其相关常量（`_AUTO_SAVE_MIN_LENGTH`, `_AUTO_SAVE_COOLDOWN`, `_AUTO_SAVE_LAST_SAVED`）。该功能与 OpenViking provider 的 `sync_turn` + `on_session_end` 重复，不再需要。
+
 ## [4.3.0] — 2026-07-15
 
 ### ✨ 新功能
