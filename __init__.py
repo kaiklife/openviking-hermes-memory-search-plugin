@@ -331,12 +331,37 @@ def inject_relevant_memories(
     is_first_turn: bool = False,
     **kwargs,
 ) -> dict | None:
-    """注入相关记忆。
+    """注入相关记忆 + 重启通知。
 
     搜索 OpenViking 中与当前对话相关的记忆注入到系统提示。
     自我循环防护：自动过滤掉当前会话自己之前存到 OpenViking 的摘要。
+    重启检测：通过 boot.json PID 对比判断进程是否重启，首次检测时注入重启通知。
     """
     context_parts = []
+
+    # ── 重启检测：boot.json PID 对比 ──────────────────────────────
+    boot_path = Path(__file__).parent / "boot.json"
+    try:
+        if boot_path.exists():
+            boot_data = json.loads(boot_path.read_text())
+            current_pid = os.getpid()
+            saved_pid = boot_data.get("pid")
+            notified = boot_data.get("notified", False)
+            if saved_pid is not None and saved_pid != current_pid and not notified:
+                logger.info(
+                    "Restart detected: pid %d → %d, injecting notification",
+                    saved_pid, current_pid,
+                )
+                context_parts.append("🔄 系统已重启，记忆库已重新加载")
+                # 更新 boot.json
+                boot_data["pid"] = current_pid
+                boot_data["notified"] = True
+                boot_path.write_text(
+                    json.dumps(boot_data, ensure_ascii=False, indent=2)
+                )
+    except Exception as e:
+        logger.warning("Restart detection failed: %s", e)
+    # ──────────────────────────────────────────────────────────────
 
     # 搜索 OpenViking 记忆
     if _should_search(user_message, is_first_turn):

@@ -1,5 +1,11 @@
 # Changelog
 
+## [4.3.0] — 2026-07-15
+
+### ✨ 新功能
+
+- **重启通知恢复** — 在 `inject_relevant_memories` 中恢复 boot.json PID 检测逻辑。进程重启后首次调用时注入 "🔄 系统已重启，记忆库已重新加载" 通知。boot.json 格式统一为 `{boot_time, pid, notified}`。
+
 ## [4.2.0] — 2026-07-14
 
 ### 🐛 Bug Fixes
