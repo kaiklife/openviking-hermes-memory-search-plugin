@@ -52,13 +52,10 @@ _AUTO_SAVE_MIN_LENGTH = 30
 _AUTO_SAVE_COOLDOWN = 120  # 同一 session 两次保存最短间隔（秒）
 _AUTO_SAVE_LAST_SAVED: dict[str, float] = {}  # session_id -> 上次保存时间
 
-# 插件目录 + boot 标记
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-PLUGIN_DIR = HERMES_HOME / "plugins" / "hermes-memory-search"
-BOOT_MARKER = PLUGIN_DIR / "boot.json"
 STATE_DB = HERMES_HOME / "state.db"
 
-# 写操作需要 API Key
+# OpenViking 写操作
 _OV_API_KEY = "ov-root-key-2026"
 _WRITE_HEADERS = {
     "X-OpenViking-Account": "fanwenkai",
@@ -66,146 +63,6 @@ _WRITE_HEADERS = {
     "X-API-Key": _OV_API_KEY,
     "Content-Type": "application/json",
 }
-
-# 超过此秒数的标记差异视为「重启」
-_RESTART_THRESHOLD_SECONDS = 30
-
-# 自动存记忆的 URI 前缀，用于在搜索结果中过滤当前 session 的自存内容
-_AUTO_MEMORIES_URI_PREFIX = "viking://resources/hermes-auto-memories/"
-
-
-# ─── 重启无感感知 ─────────────────────────────────────
-
-
-def _detect_restart() -> tuple[bool, float, float]:
-    """检测是否是重启后的首次加载。
-
-    返回 (is_restart, prev_boot_ts, current_boot_ts)。
-    prev_boot_ts 用于后续查询重启前那个会话。
-    current_boot_ts 是当前进程的启动时间戳，用于 SQL 查询边界。
-
-    判断逻辑：
-    1. PID 变化 -> 绝对就是新进程（OOM/crash/systemctl 都会触发）
-    2. 时间差 > 30 秒 -> 补充判断（boot.json 被删等极端情况兜底）
-    没有 boot.json -> 首次安装或已清理，不触发
-    """
-    now = time.time()
-    is_restart = False
-    prev_boot_ts = 0.0
-    current_pid = os.getpid()
-
-    try:
-        PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
-
-        if BOOT_MARKER.exists():
-            try:
-                data = json.loads(BOOT_MARKER.read_text(encoding="utf-8"))
-                prev_boot_ts = data.get("ts", 0.0)
-                old_pid = data.get("pid")
-
-                # PID 不同 -> 新进程，必是重启
-                if old_pid is not None and old_pid != current_pid:
-                    is_restart = True
-                    logger.info(
-                        "Restart detected (pid changed: %s -> %s)",
-                        old_pid, current_pid,
-                    )
-                # 时间差 > 阈值（兜底：boot.json 被删重建等）
-                elif now - prev_boot_ts > _RESTART_THRESHOLD_SECONDS:
-                    is_restart = True
-                    logger.info(
-                        "Restart detected (last boot: %.1fs ago, pid: %s)",
-                        now - prev_boot_ts, current_pid,
-                    )
-            except (json.JSONDecodeError, OSError, TypeError):
-                pass
-
-        # 保存当前 PID 和时间戳
-        marker = {"ts": now, "pid": current_pid}
-        if is_restart:
-            marker["prev_ts"] = prev_boot_ts
-
-        BOOT_MARKER.write_text(
-            json.dumps(marker, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError as e:
-        logger.warning("Failed to write boot marker: %s", e)
-
-    return is_restart, prev_boot_ts, now
-
-
-# 模块级：插件被导入时立即检测
-_RESTART_DETECTED, _RESTART_PREV_BOOT_TS, _RESTART_CURRENT_TS = _detect_restart()
-# per-session 追踪：每个 session 独立获得一次重启通知，不互相抢
-# 避免 Gateway 多 session 环境下第一个 session 消费掉全局 flag
-_RESTART_NOTIFIED_SESSIONS: set[str] = set()
-
-
-def _get_last_session_summary(before_ts: float, current_ts: float) -> str | None:
-    """从 state.db 查询重启前最后一个会话摘要。
-
-    在重启感知场景中：
-    - before_ts 是上一次进程 boot 的时间戳（prev_boot_ts）
-    - current_ts 是当前进程 boot 的时间戳（当前 now）
-
-    SQL 使用 started_at < current_ts 找到当前进程启动前
-    最新完成的那个会话，排除重启后可能产生的新会话。
-    """
-    if not STATE_DB.exists() or before_ts <= 0:
-        return None
-
-    import sqlite3
-
-    db = None
-    try:
-        db = sqlite3.connect(str(STATE_DB), timeout=5.0)
-        db.row_factory = sqlite3.Row
-
-        session = db.execute(
-            """
-            SELECT id, source, model, started_at, message_count
-            FROM sessions
-            WHERE source != 'cron'
-              AND started_at < ?
-            ORDER BY started_at DESC
-            LIMIT 1
-            """,
-            (current_ts,),
-        ).fetchone()
-
-        if not session:
-            return None
-
-        messages = db.execute(
-            """
-            SELECT role, content
-            FROM messages
-            WHERE session_id = ? AND role = 'user'
-            ORDER BY timestamp ASC
-            LIMIT 2
-            """,
-            (session["id"],),
-        ).fetchall()
-
-        parts = [f"上一个会话（{session['source']}）"]
-        for msg in messages:
-            content = (msg["content"] or "").strip()[:120]
-            if content:
-                display = content[:117] + "..." if len(content) > 120 else content
-                parts.append(f"对话：{display}")
-
-        return "\n".join(parts)
-
-    except Exception as e:
-        logger.warning("Failed to query state.db: %s", e)
-        return None
-    finally:
-        if db:
-            try:
-                db.close()
-            except Exception:
-                pass
 
 
 # ─── 记忆搜索（pre_llm_call） ───────────────────────────────
@@ -238,7 +95,7 @@ def _search_openviking(query: str, limit: int) -> list[dict]:
 
     payload = json.dumps({
         "query": query[:MAX_QUERY_LENGTH],
-        "limit": safe_limit,
+        "limit": safe_limit * 2,  # 多取一些用于去重
         "score_threshold": SCORE_THRESHOLD,
     }).encode("utf-8")
 
@@ -264,19 +121,28 @@ def _search_openviking(query: str, limit: int) -> list[dict]:
     if not memories:
         return []
 
-    # 客户端侧二次过滤：score 缺失时默认通过，显式低分才剔除
+    # 二次过滤：score 必须有且 >= 阈值，score=None 直接排除
     filtered = [
         m for m in memories
-        if m.get("score") is None or m["score"] >= SCORE_THRESHOLD
+        if m.get("score") is not None and m["score"] >= SCORE_THRESHOLD
     ]
 
-    return filtered[:safe_limit]
+    # 去重：按 abstract 文本去重（相同内容只保留一次）
+    seen_abstracts: set[str] = set()
+    deduped = []
+    for m in filtered:
+        abstract = (m.get("abstract") or "").strip()
+        if abstract and abstract not in seen_abstracts:
+            seen_abstracts.add(abstract)
+            deduped.append(m)
+
+    return deduped[:safe_limit]
 
 
 def _build_memory_context(items: list[dict], exclude_session_id: str = "") -> str | None:
     """Format search results into a compact context string.
 
-    过滤掉 auto-save 写入的当前会话内容（自反馈循环防护）。
+    过滤掉 hermes-auto-memories 路径下当前 session 自己存的内容（自反馈循环防护）。
     """
     lines = []
     for item in items:
@@ -284,8 +150,8 @@ def _build_memory_context(items: list[dict], exclude_session_id: str = "") -> st
         ctype = item.get("context_type", "memory")
         uri = item.get("uri", "")
 
-        # 自反馈过滤：跳过 auto-memories 路径下当前 session 自己存的内容
-        if exclude_session_id and _AUTO_MEMORIES_URI_PREFIX in uri:
+        # 自反馈过滤：跳过 auto-memories 中当前 session 的内容
+        if exclude_session_id and "hermes-auto-memories" in uri:
             sid_prefix = exclude_session_id[:12]
             if sid_prefix in abstract or sid_prefix in uri:
                 logger.debug(
@@ -383,9 +249,8 @@ def auto_save_memories(
     if len(assistant_text) > 120:
         assistant_summary += "..."
 
-    now_dt = datetime.now()
-    today = now_dt.strftime("%Y-%m-%d")
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M")
+    today = datetime.now().strftime("%Y-%m-%d")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     content = (
         f"## 对话摘要\n\n"
@@ -438,7 +303,7 @@ def auto_save_memories(
                     headers=_WRITE_HEADERS,
                     method="POST",
                 )
-                with urllib.request.urlopen(req_create, timeout=REQUEST_TIMEOUT) as cr:
+                with urllib.request.urlopen(req_create, timeout=10) as cr:
                     create_body = json.loads(cr.read().decode("utf-8"))
                     if create_body.get("status") == "ok":
                         _AUTO_SAVE_LAST_SAVED[session_id] = time.time()
@@ -466,37 +331,14 @@ def inject_relevant_memories(
     is_first_turn: bool = False,
     **kwargs,
 ) -> dict | None:
-    """注入重启通知 + 相关记忆。
+    """注入相关记忆。
 
-    首轮：如果检测到重启，从 state.db 查上一个会话摘要，注入通知。
-          同时搜索记忆。
-    后续轮：仅搜索记忆。
-    完全无感——不需要手动写任何状态文件。
+    搜索 OpenViking 中与当前对话相关的记忆注入到系统提示。
+    自我循环防护：自动过滤掉当前会话自己之前存到 OpenViking 的摘要。
     """
     context_parts = []
 
-    logger.debug(
-        "inject: RESTART_DETECTED=%s, session_id=%s, notified=%s, first_turn=%s, msg_len=%d",
-        _RESTART_DETECTED, session_id[:16], session_id in _RESTART_NOTIFIED_SESSIONS,
-        is_first_turn, len(user_message),
-    )
-
-    # 第 1 层：重启通知（每个 session 只注入一次，不依赖 is_first_turn）
-    if _RESTART_DETECTED and session_id not in _RESTART_NOTIFIED_SESSIONS:
-        _RESTART_NOTIFIED_SESSIONS.add(session_id)
-        lines = [
-            "🔄 **系统重启通知**",
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-            "Hermes 网关刚刚重启了。",
-        ]
-        # 从 state.db 查重启前在干什么
-        last = _get_last_session_summary(_RESTART_PREV_BOOT_TS, _RESTART_CURRENT_TS)
-        if last:
-            lines.append(last)
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-        context_parts.append("\n".join(lines))
-
-    # 第 2 层：OpenViking 记忆搜索（过滤当前 session 的 auto-save 内容）
+    # 搜索 OpenViking 记忆
     if _should_search(user_message, is_first_turn):
         limit = MAX_RESULTS_FIRST_TURN if is_first_turn else MAX_RESULTS_SUBSEQUENT
         items = _search_openviking(user_message, limit)
@@ -505,15 +347,10 @@ def inject_relevant_memories(
             context_parts.append(memory_ctx)
 
     if not context_parts:
-        logger.debug("inject: no context parts, returning None")
         return None
 
     separator = "\n" + "━━━━━━━━━━━━━━━━━━━━━━━━" + "\n"
     merged = separator.join(context_parts)
     full_context = merged + "\n" + "━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    logger.debug(
-        "inject: returning context with %d part(s), len=%d",
-        len(context_parts), len(full_context),
-    )
     return {"context": full_context}
