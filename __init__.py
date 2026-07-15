@@ -1,21 +1,16 @@
-"""hermes-memory-search: 自动从 OpenViking 拉取相关记忆 + 重启无感感知。
+"""hermes-memory-search: 自动从 OpenViking 拉取相关记忆 + 重启检测。
 
 在每轮 LLM 调用前自动搜索 OpenViking 中与当前对话相关的记忆，
 以 context 形式注入系统提示。
 
-重启感知：插件通过 boot.json 标记文件自动检测进程重启。
-检测到重启后，从 state.db 查询上一个会话的内容，自动注入摘要。
-无需手动保存状态，无需额外步骤，完全无感。"""
+重启感知：通过 boot.json PID 对比检测进程重启，首次检测时注入重启通知。"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-import time
-import urllib.error
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -30,7 +25,6 @@ _SKIP_MESSAGES = frozenset({
 
 OPENVIKING_URL = "http://127.0.0.1:1933"
 SEARCH_ENDPOINT = f"{OPENVIKING_URL}/api/v1/search/search"
-CONTENT_WRITE_ENDPOINT = f"{OPENVIKING_URL}/api/v1/content/write"
 SEARCH_HEADERS = {
     "X-OpenViking-Account": "fanwenkai",
     "X-OpenViking-User": "fanwenkai",
@@ -45,18 +39,6 @@ ABSTRACT_MAX_LENGTH = 150
 REQUEST_TIMEOUT = 5
 MIN_MSG_LENGTH_FIRST = 2
 MIN_MSG_LENGTH_SUBSEQUENT = 5
-
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-STATE_DB = HERMES_HOME / "state.db"
-
-# OpenViking 写操作
-_OV_API_KEY = "ov-root-key-2026"
-_WRITE_HEADERS = {
-    "X-OpenViking-Account": "fanwenkai",
-    "X-OpenViking-User": "fanwenkai",
-    "X-API-Key": _OV_API_KEY,
-    "Content-Type": "application/json",
-}
 
 
 # ─── 记忆搜索（pre_llm_call） ───────────────────────────────
