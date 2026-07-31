@@ -10,7 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
+import time
+import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -36,7 +40,7 @@ MAX_RESULTS_FIRST_TURN = 5
 MAX_RESULTS_SUBSEQUENT = 2
 MAX_QUERY_LENGTH = 200
 ABSTRACT_MAX_LENGTH = 150
-REQUEST_TIMEOUT = 5
+REQUEST_TIMEOUT = 10  # [Fix #8] 超时从 5 秒改为 10 秒，避免慢请求被截断
 MIN_MSG_LENGTH_FIRST = 2
 MIN_MSG_LENGTH_SUBSEQUENT = 5
 
@@ -57,24 +61,15 @@ def _extract_restart_context_from_session(session_id: str, max_msgs: int = 5) ->
         return ""
     
     try:
-        # 读最后 N 行（消息）
-        lines = []
-        with open(session_file, "rb") as f:
-            # 从文件末尾往前读
-            f.seek(0, 2)
-            file_size = f.tell()
-            pos = file_size
-            while pos > 0 and len(lines) < max_msgs * 2:  # 多读一些，跳过 tool 消息
-                pos = max(0, pos - 4096)
-                f.seek(pos)
-                chunk = f.read(min(4096, file_size - pos))
-                lines.extend(chunk.split(b"\n"))
-                if len(lines) >= max_msgs * 2:
-                    break
+        # [Fix #4] 用 deque 高效读取最后 N 行，避免反向分块读取的复杂逻辑和重复读取风险
+        last_lines = deque(maxlen=max_msgs * 4)  # 多取一些以跳过 tool 消息
+        with open(session_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                last_lines.append(line)
         
         # 解析最后几条 assistant 消息
         restart_hints = []
-        for line in lines[-20:]:  # 看最后20行
+        for line in last_lines:
             line = line.strip()
             if not line:
                 continue
@@ -90,9 +85,13 @@ def _extract_restart_context_from_session(session_id: str, max_msgs: int = 5) ->
             if not content:
                 continue
             
-            # 找包含"重启"相关关键词的消息
+            # [Fix #6] 扩展关键词列表，覆盖更多重启/修复场景
             lower = content.lower()
-            if any(kw in lower for kw in ["重启", "restart", "修复", "改了一下", "修改了", "修好了"]):
+            if any(kw in lower for kw in [
+                "重启", "restart", "重开", "reload",
+                "修复", "fix", "改了一下", "修改了", "修好了",
+                "更新", "upgrade", "patch",
+            ]):
                 # 提取前200字符作为摘要
                 hint = content[:200].replace("\n", " ").strip()
                 if hint:
@@ -118,7 +117,8 @@ def register(ctx) -> None:
 
 def _should_search(user_message: str, is_first_turn: bool) -> bool:
     """判断是否需要搜索——跳过短消息和确认性回复。"""
-    msg = user_message.strip()
+    # [Fix #2] 防止 user_message=None 时 strip() 抛 AttributeError
+    msg = (user_message or "").strip()
     if not msg:
         return False
     if msg in _SKIP_MESSAGES:
@@ -131,7 +131,7 @@ def _should_search(user_message: str, is_first_turn: bool) -> bool:
 
 def _search_openviking(query: str, limit: int) -> list[dict]:
     """Search OpenViking and return relevant memory items."""
-    import urllib.request
+    # [Fix #7] 删除冗余的 import urllib.request（已在文件顶部导入）
 
     safe_limit = max(1, limit)
 
@@ -148,11 +148,33 @@ def _search_openviking(query: str, limit: int) -> list[dict]:
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        logger.warning("OpenViking search failed: %s", e)
+    # [Fix #5] 网络请求加重试：最多 2 次尝试，区分可重试/不可重试错误
+    body = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            break  # 成功则跳出重试循环
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                # 客户端错误（4xx）不重试
+                logger.warning("OpenViking HTTP %d: %s", e.code, e)
+                return []
+            # 服务端错误（5xx）可以重试
+            if attempt == 0:
+                time.sleep(0.5 * (attempt + 1))  # 简单退避
+                continue
+            logger.warning("OpenViking search failed after 2 attempts: %s", e)
+            return []
+        except Exception as e:
+            # 网络错误可以重试
+            if attempt == 0:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            logger.warning("OpenViking search failed after 2 attempts: %s", e)
+            return []
+
+    if body is None:
         return []
 
     if body.get("status") != "ok":
@@ -215,6 +237,27 @@ def _build_memory_context(items: list[dict], exclude_session_id: str = "") -> st
     )
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """[Fix #1] 原子写入 JSON 文件，避免并发读写的竞态条件。
+    
+    使用 tempfile + os.replace() 确保写入是原子的：
+    先写到临时文件，再原子替换目标文件。
+    """
+    dir_path = path.parent
+    fd, tmp_path = tempfile.mkstemp(suffix=".tmp", dir=dir_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_f:
+            json.dump(data, tmp_f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)  # 原子替换
+    except Exception:
+        # 清理临时文件
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 # ─── pre_llm_call 主入口 ───────────────────────────────
 
 
@@ -240,7 +283,8 @@ def inject_relevant_memories(
             current_pid = os.getpid()
             saved_pid = boot_data.get("pid")
             notified = boot_data.get("notified", False)
-            if saved_pid is not None and saved_pid != current_pid:
+            # [Fix #3] saved_pid 类型校验：防止 boot.json 被手动编辑后 saved_pid 为字符串
+            if isinstance(saved_pid, int) and saved_pid != current_pid:
                 boot_time = boot_data.get("boot_time", "unknown")
                 logger.info(
                     "Restart detected: pid %d → %d, injecting notification",
@@ -274,12 +318,10 @@ def inject_relevant_memories(
                     f"• 旧PID: {saved_pid} → 新PID: {current_pid}\n"
                     f"• 状态: 记忆库已重新加载{restart_context}"
                 )
-                # 更新 boot.json
+                # [Fix #1] 用原子写入更新 boot.json，避免并发竞态
                 boot_data["pid"] = current_pid
                 boot_data["notified"] = True
-                boot_path.write_text(
-                    json.dumps(boot_data, ensure_ascii=False, indent=2)
-                )
+                _atomic_write_json(boot_path, boot_data)
     except Exception as e:
         logger.warning("Restart detection failed: %s", e)
     # ──────────────────────────────────────────────────────────────
