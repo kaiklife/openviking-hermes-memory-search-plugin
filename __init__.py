@@ -41,6 +41,73 @@ MIN_MSG_LENGTH_FIRST = 2
 MIN_MSG_LENGTH_SUBSEQUENT = 5
 
 
+def _extract_restart_context_from_session(session_id: str, max_msgs: int = 5) -> str:
+    """从 session jsonl 文件自动提取重启前上下文。
+    
+    读取最后几条 assistant 消息，提取包含"重启"关键词的内容。
+    """
+    if not session_id:
+        return ""
+    
+    sessions_dir = Path.home() / ".hermes" / "sessions"
+    session_file = sessions_dir / f"{session_id}.jsonl"
+    
+    if not session_file.exists():
+        logger.debug("Session file not found: %s", session_file)
+        return ""
+    
+    try:
+        # 读最后 N 行（消息）
+        lines = []
+        with open(session_file, "rb") as f:
+            # 从文件末尾往前读
+            f.seek(0, 2)
+            file_size = f.tell()
+            pos = file_size
+            while pos > 0 and len(lines) < max_msgs * 2:  # 多读一些，跳过 tool 消息
+                pos = max(0, pos - 4096)
+                f.seek(pos)
+                chunk = f.read(min(4096, file_size - pos))
+                lines.extend(chunk.split(b"\n"))
+                if len(lines) >= max_msgs * 2:
+                    break
+        
+        # 解析最后几条 assistant 消息
+        restart_hints = []
+        for line in lines[-20:]:  # 看最后20行
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            
+            if msg.get("role") != "assistant":
+                continue
+            
+            content = msg.get("content", "")
+            if not content:
+                continue
+            
+            # 找包含"重启"相关关键词的消息
+            lower = content.lower()
+            if any(kw in lower for kw in ["重启", "restart", "修复", "改了一下", "修改了", "修好了"]):
+                # 提取前200字符作为摘要
+                hint = content[:200].replace("\n", " ").strip()
+                if hint:
+                    restart_hints.append(hint)
+        
+        if restart_hints:
+            # 取最后2条最相关的
+            return "\n".join(f"• {h}" for h in restart_hints[-2:])
+        
+    except Exception as e:
+        logger.warning("Failed to extract restart context from session: %s", e)
+    
+    return ""
+
+
 # ─── 记忆搜索（pre_llm_call） ───────────────────────────────
 
 
@@ -173,12 +240,40 @@ def inject_relevant_memories(
             current_pid = os.getpid()
             saved_pid = boot_data.get("pid")
             notified = boot_data.get("notified", False)
-            if saved_pid is not None and saved_pid != current_pid and not notified:
+            if saved_pid is not None and saved_pid != current_pid:
+                boot_time = boot_data.get("boot_time", "unknown")
                 logger.info(
                     "Restart detected: pid %d → %d, injecting notification",
                     saved_pid, current_pid,
                 )
-                context_parts.append("🔄 系统已重启，记忆库已重新加载")
+                # 读取重启前上下文：优先手动存的文件，否则自动从 session 提取
+                restart_context = ""
+                restart_context_file = Path.home() / ".hermes" / "restart_context.json"
+                if restart_context_file.exists():
+                    try:
+                        ctx_data = json.loads(restart_context_file.read_text())
+                        restart_context = (
+                            f"\n\n**重启前上下文：**\n"
+                            f"- 干了啥: {ctx_data.get('what', '未知')}\n"
+                            f"- 为啥重启: {ctx_data.get('why', '未知')}\n"
+                            f"- 接下来: {ctx_data.get('next', '未知')}\n"
+                            f"- 时间: {ctx_data.get('time', '未知')}"
+                        )
+                        restart_context_file.unlink()  # 读完删掉，避免重复注入
+                    except Exception as e:
+                        logger.warning("Failed to read restart context: %s", e)
+                else:
+                    # 自动从 session jsonl 提取重启上下文
+                    auto_ctx = _extract_restart_context_from_session(session_id)
+                    if auto_ctx:
+                        restart_context = f"\n\n**重启前上下文（自动提取）：**\n{auto_ctx}"
+                
+                context_parts.append(
+                    f"🔄 **系统重启通知**\n"
+                    f"• 重启时间: {boot_time}\n"
+                    f"• 旧PID: {saved_pid} → 新PID: {current_pid}\n"
+                    f"• 状态: 记忆库已重新加载{restart_context}"
+                )
                 # 更新 boot.json
                 boot_data["pid"] = current_pid
                 boot_data["notified"] = True
